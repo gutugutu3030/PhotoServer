@@ -13,9 +13,13 @@ services:
   immich-server:
     container_name: immich_server
     image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    runtime: nvidia
     extends:
       file: hwaccel.transcoding.yml
       service: nvenc # set to one of [nvenc, quicksync, rkmpp, vaapi, vaapi-wsl] for accelerated transcoding
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
     volumes:
       # Do not edit the next line. If you want to change the media storage location on your system, edit the value of UPLOAD_LOCATION in the .env file
       - ${UPLOAD_LOCATION}:/usr/src/app/upload
@@ -67,6 +71,33 @@ services:
     volumes:
       # Do not edit the next line. If you want to change the database storage location on your system, edit the value of DB_DATA_LOCATION in the .env file
       - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    restart: always
+  
+  ftpd_server:
+    #イメージの指定とコンテナ名指定
+    image: stilliard/pure-ftpd
+    container_name: pure-ftpd
+
+    #PASV用に30000-30009を開く必要があるらしい
+    ports:
+      - "21:21"
+      - "30000-30009:30000-30009"
+
+    #docker-compose.yml の下に出来る data フォルダが
+    #FTP サーバーのログインユーザーのホームディレクトリとしてマウントされる設定
+    #あとパスワードの保存先もローカルフォルダにマッピング
+    volumes:
+      - "./ftpData:/home/${FTPUSER}/"
+      - "./ftpPasswd:/etc/pure-ftpd/passwd"
+
+    #ホスト名、ユーザー名、パスワード、ホームディレクトリの設定
+    #ユーザー名とパスワードは環境設定ファイルに持つようにする。
+    environment:
+      PUBLICHOST: "localhost"
+      FTP_USER_NAME: ${FTPUSER}
+      FTP_USER_PASS: ${FTPPASS}
+      FTP_USER_HOME: /home/${FTPUSER}
+
     restart: always
 
 volumes:
