@@ -1,5 +1,7 @@
 library
+database
 postgres
 ftpData
 ftpPasswd
 .env
+/.DS_Store
