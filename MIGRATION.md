@@ -1,146 +1,105 @@
-# Linux/NVIDIA から Apple Silicon Mac（Colima + LaunchDaemon）への移行
+# Apple Silicon Mac（Colima + LaunchDaemon）での Immich サーバ構築
 
-この文書は移行の準備・実施手順と、移行後の電源投入時自動起動の設計をまとめたものである。**この段階では `compose.yml` は変更していない。** 現在の `compose.yml` はLinux/NVIDIA向けのため、そのままMac上で起動しないこと。Mac向けComposeへの切り替えは、本手順を確認した後の別作業である。
+この文書は Apple Silicon Mac 上での Immich サーバ構築・データ復元・電源投入時自動起動の設計と実施手順をまとめたものである。旧環境は撤去済みで、Linux環境は存在しない。Mac上への新規構築と写真データの復元を主眼とする。
 
-## 決定事項（2026-09-25）
+## 構成の決定事項
 
 - **コンテナランタイムは Colima を採用する。** OrbStack は採用しない。理由: OrbStack はGUIアプリがユーザセッションで動くことが前提で、ログインしていない状態でのデーモン起動は unsupported（[Issue #194](https://github.com/orbstack/orbstack/issues/194) で要望のみ）。電源投入後の無操作起動と両立できない。
 - **FileVault は内蔵SSDについて ON を維持する。** 起動手順は「電源ON → FileVaultの解除パスワードを1回入力 → 以降はログイン操作なしでサーバが起動」。GUI自動ログイン（kcpassword 追記など）は採用しない。セキュリティを落としたくないため。
 - **自動起動は `/Library/LaunchDaemons` の LaunchDaemon（system domain）で行う。** LaunchDaemon はログイン前に起動するため、GUIログイン・自動ログインは不要。
-- **Colima/Lima は root では実行できない。** Lima は root 実行を拒否し、Colima も root でのサービス化はサポート対象外（[Discussion #974](https://github.com/abiosoft/colima/discussions/974)）。そこで「LaunchDaemon自体をrootで管理しつつ、Colima起動コマンドは sudo -u で非rootのサービスユーザへ降りる」構成とする。「Immichをroot権限で動かす」という当初案は、この制約により **LaunchDaemon=root管理 / Colima・Dockerプロセス=非rootサービスユーザ** に修正する。
+- **Colima/Lima は root では実行できない。** Lima は root 実行を拒否し、Colima も root でのサービス化はサポート対象外（[Discussion #974](https://github.com/abiosoft/colima/discussions/974)）。そこで「LaunchDaemon自体をrootで管理しつつ、Colima起動コマンドは sudo -u で非rootのサービスユーザへ降りる」構成とする。**LaunchDaemon=root管理 / Colima・Dockerプロセス=非rootサービスユーザ（`immich`）**。
+- **サービスユーザは `immich`（標準ユーザ、管理者ではない）を作成済み。** システム設定 > ユーザとグループ のGUIから作成してよい。GUIログインはしない。ログインウィンドウに表示したくなければ `sudo defaults write /Library/Preferences/com.apple.loginwindow HiddenUsersList -array-add immich` で隠せる（任意）。
 - Immichの機械学習・動画変換はCPU実行。Apple SiliconのGPU加速は前提にしない。
-- FTPサービス（`ftpd_server`）は移行しない。Immichのホスト公開ポート `930` は維持する。
+- FTPサービスは使わない（旧環境で使っていたが廃止）。Immichのホスト公開ポート `930` は維持する。
 
-## 自動起動の全体設計
+## 実行環境の実績値（2026-09-26 構築済み）
 
-```
-電源ON
- └ FileVault 解除画面（パスワード1回入力 = 唯一の操作）
-    └ macOS 起動（GUIログインのまま放置してよい）
-       └ LaunchDaemon (root, RunAtLoad) が /opt/immich/bin/immich-autostart.sh を起動
-          1. 外付けSSDが現れるまで待機 → diskutil でマウント（未接続なら空ディレクトリで起動せず待機）
-          2. colima start（サービスユーザで実行、冪等。既に起きていればスキップ）
-          3. docker compose up -d --wait（/opt/immich/run の compose + .env）
-          4. curl で localhost:930 を確認
-          5. sleep して再チェック（KeepAlive と合わせ常時監視・復旧）
-```
+- Mac: M5 Max（18コア）/ 128GB RAM / macOS 27.0。
+- Colima 0.10.3 / docker 29.8.1 / docker-compose 5.5.1（Homebrew）。VMスペックは **4 CPU / 8 GiB / ディスク100 GiB**（`colima list` で確認）。
+- VM作成コマンド（外部SSDマウント済みの状態で実行済み）:
 
-- 加電喪失後の自動復帰のため `sudo pmset -a autorestart 1` を設定しておく。
-- サーバ用途のため `sudo pmset -a sleep 0 disksleep 0` でスリープを無効化する。
+  ```
+  sudo mkdir -p /opt/immich/run /opt/immich/bin /opt/immich/postgres /opt/immich/secrets
+  sudo chown -R immich /opt/immich/run /opt/immich/postgres
+  sudo -u immich -H env COLIMA_HOME=/Users/immich/.colima \
+    /opt/homebrew/bin/colima start \
+    --runtime docker --vm-type vz --cpu 4 --memory 8 --disk 100 \
+    --mount /Volumes/database4t:w --mount /opt/immich:w
+  ```
 
-## 移行先の方針
+- 外付けSSD: `/Volumes/database4t`（APFS、disk5s1、**Volume UUID 852C2D25-3042-48BB-8AB9-AA1D407BF8CE**）、写真フォルダ `immich`。
+- Docker socket: `/Users/immich/.colima/default/docker.sock`（サービスユーザHOME配下、管理者からは到達不能=意図通り）。
+- Compose実行コピー: `/opt/immich/run/{compose.yml,.env}`（.env は `immich:staff` の `600`）。リポジトリの `compose.yml` と `.env` が原本。
+- 書き込み検証済み: コンテナroot・uid999（postgres相当）の両方で `/opt/immich/postgres`、`/opt/immich/run`、`/Volumes/database4t` への書き込みとbind mount動作を確認。
+- virtiofsの既知挙動: bind mount上では `chown` がエラーを出さずに無視される（所有者はホスト側のまま）。プレースホルダ遂行のためには問題ない。投入データのアクセスはVM内utilisateurのuid直接書き込みでも通るので問題なく使用できる。
+  - 注意: `mount` で `/Volumes/database4t` が `noowners` になっている。所有権の無視が機能している状態。写真データを本置換した際に `sudo vsdbutil -d /Volumes/database4t` で所有権有効化し、データ配下を Immich コンテナから書き込み可能な所有者へ chown するのを推奨。
+- DBダンプ: `database/immich-db-backup-20260924T095825-v3.0.2-pg14.19.sql.gz`（旧環境 v3.0.2 時点のもの）。**これを復元に使う。**
 
-- ComposeプロジェクトとGitリポジトリはMac内蔵SSDに置く。
-- 自動起動用のランタイム配置（スクリプト・composeの実行コピー・.env実ファイル）は `/opt/immich/` 配下に置き、所有者はサービスユーザとする。Gitリポジトリは管理用の本体とする。
-- Docker Engine は Colima を使い、操作は通常どおり `docker compose` で行う。Docker socket は `~/.colima/default/docker.sock`（サービスユーザのHOME配下）。
-- Immichの機械学習・動画変換はCPU実行とする。Apple SiliconのGPU加速は前提にしない。
-- PostgreSQLはMac内蔵SSD（`/opt/immich/postgres`）上に新規作成し、Linux側から作った論理DBダンプを復元する。
-- 写真・動画は外付けSSDに置く。移行用SSDは一時退避用で、最終保存先とは分ける。
-- 旧Linux SSDをext4のまま使う案は採用しない。macOSはext4をマウントできず、OrbStack固有のUSBパススルー（Linux側マウントをthinfs経由で共有する仕組み）はColima/Limaには同等機能がないため。旧Linux SSDは退避コピーの照合後にAPFSで初期化し、写真・動画を戻す。
-- 外付けSSDはAPFSとする。exFATは権限・所有者が保持されないため最終保存先に使わない。
-- 外付けSSDの暗号化: APFS暗号化でボリュームを作成し、Unlock用パスフレーズをrootのみ読める鍵ファイル（`/opt/immich/secrets/` 配下、mode 600）に置いて `diskutil apfs unlockVolume ... -stdinpassphrase` する案を基本とする。**未検証項目なので実機で必ず確認すること。** 確認できなければ、物理盗难リスクを受け入れて非暗号化とするか、運用方針を見直す（FileVaultの自動解除キーはGUIログインユーザのキーチェーンに紐づくため、ログイン前にカジュアルに解除できる仕組みは keycode を保持するしかない）。
+## 現在の構成
 
-## 現在の構成で確認できていること
-
-- `.env` の設定値は `IMMICH_VERSION=v3.0.2`。
-- `UPLOAD_LOCATION=/home/yo/immich-server/library`。
-- `DB_DATA_LOCATION=/home/yo/immich-server/postgres`。
+- `.env`（Git追跡対象外）: `IMMICH_VERSION=v3.0.2`、`UPLOAD_LOCATION=/Volumes/database4t/immich`、`DB_DATA_LOCATION=/opt/immich/postgres`。
+- `compose.yml`: Mac用に修正済み（NVIDIA/CUDA/NVENC/ftpd_server 削除、`immich-server` は `immich-machine-learning` ともにCPU実行、Port 930→2283）。
 - PostgreSQLイメージは `ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0`。
-- 現行ComposeはNVIDIA/NVENCとCUDAを指定している。`.env` にもNVENCの設定がある。
-- 確認できる最新の既存DBバックアップは `immich-db-backup-20260621T020000-v2.7.5-pg14.19.sql.gz`。設定上の `v3.0.2` より古いため、移行用バックアップには使わず、移行直前に現行稼働版から作り直す。
-
-これらはリポジトリとファイル名から分かる設定・記録であり、実際の稼働バージョンや最新のデータ状態は移行開始時にLinux側で確認する。
+- `.env.example`: この compose のパラメータを値のみ置換したテンプレート（DBパスワード除外、実値はローカル.swift)で設定する。
 
 ## 手順
 
-### 1. Mac移行用の文書・設定をGitブランチへ用意する
+### 1. Mac用のComposeを用意する（完了）
 
-1. この文書と `.env.example` を確認する。
-2. Mac用Composeを作成する段階では、Immichの稼働バージョンに対応した公式Composeを基準にする。移行・復元が完了するまでは、移行元で実際に稼働しているバージョンに合わせる。
-3. Mac用Composeでは少なくとも次を反映する。
-   - `runtime: nvidia`、`NVIDIA_*`、NVENC設定、MLイメージの `-cuda` 指定を除く。
-   - 機械学習・動画変換をCPU設定にする。
-   - `ftpd_server` とFTP用の設定を除く。
-   - 写真の `UPLOAD_LOCATION` は外付けSSD上、DBの `DB_DATA_LOCATION` は `/opt/immich/postgres`（内蔵SSD）とする。
-   - ext4または外付けAPFSボリュームが未接続のとき、空のディレクトリを誤って保存先にしないようにする。保存先がマウント済みであることを確認してからComposeを起動する。
-4. `.env` の実ファイルはコミットしない。移行先では `.env.example` を元にローカルの `.env` を作り、パスとDBパスワードを設定する。自動起動用に `/opt/immich/run/.env` としてコピーし、所有者・権限は `immich:immich`・`600` にする。
+1. `compose.yml`（Mac用）と `.env.example` はブランチ `mac-orbstack-migration` にコミット済み。
+2. MacBookの（旧Linux用の）`.env` ファイルは削除済み。新Mac側の `.env` は `.env.example` を手元で複製し、DBパスワードを指定する（済み）。
 
-この文書の追加時点では、現行LinuxのComposeファイルをMac用に置き換えない。
+### 2. モバイル・WebアクセスなどのImmichへの書き込みを止めてから始める
 
-### 2. Linux側で最終DBバックアップを作成する
+アプリ・ブラウザ経由のアップロードはない（既に旧環境停止済み）。以降、写真・DBダンプともにMacからは読み取り専用として扱う。
 
-1. Immichの実稼働バージョン、PostgreSQLの状態、`UPLOAD_LOCATION` が載っているパーティションを確認する。SSDのパーティション・ファイルシステムは `lsblk -f` や `findmnt` 等で記録する。LUKSやLVMを使っている場合は、Mac側で読み出すために必要な解除・有効化手順も確認する。
-2. モバイルアップロードやWebからの変更を止める。
-3. Immich管理画面の **Administration > Job Queues > Create job > Create Database Dump** からDBダンプを作成し、完了を確認する。
-4. DBダンプの作成後にImmichへの書き込みを停止し、Immichのコンテナを正常停止する。Linuxはまだ起動したままにして、停止後にファイルを移行用SSDへコピーする。
+### 3. 外付けSSDをAPFSの保存先として用意する
 
-### 3. DBダンプと写真データを別の移行用SSDへ複製する
+1. 写真・動画保存先 `/Volumes/database4t` は APFS でマウント済み。**フォルダ `immich` が保存先**（`.env` の `UPLOAD_LOCATION=/Volumes/database4t/immich`）。
+2. 所有権が無視されているので、本データ投入後 `sudo vsdbutil -d /Volumes/database4t` で所有権を有効化し、写真データ配下の所有権・モードを設定する。
+3. Spotlightのインデックス走査をOFFにするとサーバ運転が軽い（任意）: `sudo mdutil -i off /Volumes/database4t`。
+4. Compose の bind mount から読み書きできることをテストしてから本番データを置く。稼働中に取り外さない。
 
-1. 移行用SSDに、`UPLOAD_LOCATION` 全体とDBダンプを置ける空き容量があることを確認する。
-2. `UPLOAD_LOCATION`（現在の設定では `/home/yo/immich-server/library`）の**中身全体**をコピーする。`backups`、`encoded-video`、`library`、`profile`、`thumbs`、`upload` などを含める。最終DBダンプがこの中に作成されている場合も、コピー先に含まれていることを確認する。
-3. 移行用SSDは一時運搬用としてLinuxとMacの両方から扱える形式にする。exFATを使う場合は、Linuxの所有者・権限情報がそのまま保持される前提にせず、最終保存先でImmichが読み書きできることを確認する。FAT32は大容量ファイルの制限があるため使わない。
-4. コピー後にファイル数・容量を照合し、DBダンプの圧縮ファイルが検査できることを確認する。移行用SSDのコピーは、旧Linux SSDの初期化が必要になった場合の退避データとして保持する。
+### 4. Immichサーバを起動してDBダンプを復元する
 
-**PostgreSQLの生データディレクトリ `/home/yo/immich-server/postgres` は、MacのDBとしてコピー・再利用しない。** DBは新しいMac側のPostgreSQLへ論理ダンプから復元する。
+**DB新規構築**（/opt/immich/postgres は空のまま、Immichが新規起動する）:
 
-### 4. Linux SSDを外し、Macへ接続する
+```bash
+# サービスユーザでColima VMに接続したまま compose up
+sudo -u immich -H env COLIMA_HOME=/Users/immich/.colima \
+  /opt/homebrew/bin/docker compose --project-directory /opt/immich/run up -d --wait
+```
 
-移行用SSDのコピーと検査が完了したら、Linuxを完全にシャットダウンする。その後、Linux SSDを外付けケースに入れてMacへ接続する。稼働中・サスペンド中にSSDを外さない。このSSDはデータ取り込み用として一時的に使うだけで、旧データが移行できたらAPFSで初期化する（手順6）。
+**DBダンプ復元**（Immichの初回復元画面ではなく、Postgres コンテナから直接実行）:
 
-### 5. MacにColima環境を用意する
+DBダンプは `database/immich-db-backup-20260924T095825-v3.0.2-pg14.19.sql.gz`。これを `/opt/immich/db-restore/` にコピーし、以下の手順で復元する。
 
-手順5では環境の用意までを行い、Colima初回起動（手順5-4）は**手順6で外付けSSDをAPFS化・マウントした後に行う**こと。順序が逆になるとmounts設定が不正なままVMが作られる。
+```bash
+# 空のDBへダンプを投入
+gunzip -c /opt/immich/db-restore/immich-db-backup-20260924T095825-v3.0.2-pg14.19.sql.gz | \
+  docker exec -i immich_postgres psql -U postgres -d immich
+```
 
-1. Homebrewで次をインストールする。
+そのうえで Immich コンテナのみを再起動して最新DBへ接続させる:
 
-   ```
-   brew install colima docker docker-compose
-   ```
+```bash
+sudo -u immich -H env COLIMA_HOME=/Users/immich/.colima \
+  /opt/homebrew/bin/docker restart immich_server
+```
 
-   `docker compose` サブコマンドを使えるようにするため、Homebrewのdocker-composeをサービスユーザのプラグインとしてリンクする（**下の3. でサービスユーザ `immich` を作成した後に実施**）。
+### 5. 動作確認
 
-   ```
-   sudo -u immich -H mkdir -p /Users/immich/.docker/cli-plugins
-   sudo -u immich -H ln -sfn /opt/homebrew/opt/docker-compose/bin/docker-compose \
-     /Users/immich/.docker/cli-plugins/docker-compose
-   ```
+1. 起動状態とログ（`docker compose logs -f immich-server`）でエラーを確認。
+2. ブラウザで `http://<Mac>:930` を開き、管理ユーザは復元したDBに含まれるので、そのアカウントでログインできること。「ユーザー登録（新規ユーザ作成）」画面が出ていないこと（出ていたら、DBの復元が失敗している）。
+3. 写真・動画の表示、アセット数、アルバム、検索（全文検索・スマート検索）、ML処理のジョブ（画像認識等）が止まっていないかを確認。
+4. モバイルアプリからも `/Volumes/database4t/immich` 自体の写真ビューアとして扱えることを確認。
 
-2. Docker Desktopが入っている場合、Docker context を Colima に切り替えるか、DOCKER_HOST を設定してColimaのsocketを使う。socketは `~/.colima/default/docker.sock`。
-3. **サービスユーザ（例: `immich`）を作成する。** 通常（非管理者）ユーザでよい。自動ログインは設定しない。GUIログインもしない。
-   - GUIで作成する場合は システム設定 > ユーザとグループ から。CLIの場合は `sudo sysadminctl -addUser immich -password <パスワード>`。
-4. サービスユーザ配下にColimaのVM設定を固定するため、初回起動はサービスユーザとして実行してVMを作成する。**外付けSSDをAPFS化してマウントした状態（手順6が完了した状態）で実行すること。** Colimaは起動時にmountsへ未マウントのパスを登録できず、後から `colima stop && colima start --edit` で追加し直す必要がある。
+### 6. 念のためバックアップを作って退避SSDを初期化（任意だが推奨）
 
-   ```
-   sudo mkdir -p /opt/immich/run /opt/immich/bin /opt/immich/postgres /opt/immich/secrets
-   sudo chown -R immich /opt/immich/run /opt/immich/postgres
-   sudo -u immich -H env COLIMA_HOME=/Users/immich/.colima \
-     /opt/homebrew/bin/colima start \
-     --runtime docker --vm-type vz --cpu 4 --memory 8 --disk 100 \
-     --mount /Volumes/<外付けSSDボリューム>:w --mount /opt/immich:w
-   ```
+1. Immich管理画面 **Administration > Job Queues > Create job > Create Database Dump** で新ダンプを作成。macOS上に退避コピーを保存。
+2. 旧環境データ（退避SSDやdump）は、全データ・全アルバムの整合性確認が完了するまで保持してから削除。保持期間を決めておく。
 
-   - `/opt/immich`（compose実行コピー用・DB用）と外付けSSDボリュームをColimaのmountsに含めることが必須。含めていないパスはbind mountが空になる。
-   - `--mount` には `:w` を付けて書き込み可能にする。既定は読み取り専用。
-   - `Colima` のconfigはサービスユーザの `COLIMA_HOME`（`/Users/immich/.colima`）配下に作られる。**通常ユーザで `colima start` してVM設定が二重に作られないこと。**
-   - `-H` と `COLIMA_HOME` を明示するのは、launchd から起動されたプロセスには HOME や設定ディレクトリが解決されないケースがあるため。以降の `sudo -u immich ... colima` 実行はすべてこの形で統一する。
-5. 起動確認: `sudo -u immich -H env COLIMA_HOME=/Users/immich/.colima /opt/homebrew/bin/colima list` と、socket（`/Users/immich/.colima/default/docker.sock`）での `docker ps` が通ること。
-
-### 6. 外付けSSDをAPFSの保存先として用意する
-
-1. 旧Linux SSD（ext4）はmacOSから直接読めない。移行用SSDコピーから旧バックアップ相当の安全性を確認したうえで、旧Linux SSDをAPFSで初期化する。初期化はSSD上の全データを消去する。
-2. APFS化したSSDに写真・動画などの `UPLOAD_LOCATION` 全体を戻す。`UPLOAD_LOCATION` を `/Volumes/...` パスに設定する。
-3. 外付けSSDの暗号化を行う場合は、ボリュームのパスフレーズを新しい鍵ファイルに保存し、rootのみ参照可能にする（`/opt/immich/secrets/` 配下、`root:wheel`・`600`）。
-4. Composeのbind mountから読み書きできることをテストしてから本番データを置く。稼働中に取り外さない。
-
-### 7. 新しいDBへ復元し、移行を検証する
-
-1. Mac側に空のDB保存先 `/opt/immich/postgres` を用意する。所有者はサービスユーザ。
-2. 写真の保存先が正しくマウントされていることを確認してからComposeを起動する。通常ユーザで運用チェックする段階では、`.env` と compose を `/opt/immich/run` 配下に置いてサービスユーザから起動する。
-3. Immichの初回復元画面から最終DBダンプを選び、復元する。旧 `postgres` ディレクトリをDB保存先として指定しない。
-4. 起動状態とログ、写真・動画の表示、アセット数、アルバム、検索を確認する。問題がないことを確認してから通常の書き込みを再開する。
-5. 移行用SSDは、新環境でバックアップが作成でき、動作確認が完了するまで保持する。
-
-### 8. 電源投入後の自動起動を設置する（LaunchDaemon）
+### 7. 電源投入後の自動起動を設置する（LaunchDaemon）
 
 1. **起動スクリプト** `/opt/immich/bin/immich-autostart.sh`（`root:wheel`・`700`）。動作は冪等にする。
 
@@ -195,8 +154,8 @@
    done
    ```
 
-   - SSDのVolume UUIDは `diskutil info /Volumes/<ボリューム> | grep 'Volume UUID'` で取得する。スクリプト内ではUUIDから `Device Identifier`（例 `disk5s2`）に解決してから `diskutil mount` / `diskutil apfs unlockVolume` に渡す。
-   - 鍵ファイル `/opt/immich/secrets/ext-ssd.pw` は**末尾に改行を含めない**こと（`printf '%s' 'パスフレーズ' > file` で作成）。改行までパスフレーズの一部として扱われ、unlockに失敗する。
+   - SSDのVolume UUIDは `diskutil info /Volumes/database4t | grep 'Volume UUID'` で取得する（実値: `852C2D25-3042-48BB-8AB9-AA1D407BF8CE`）。スクリプト内ではUUIDから `Device Identifier`（例 `disk5s1`）に解決してから `diskutil mount` / `diskutil apfs unlockVolume` に渡す。
+   - 鍵ファイル `/opt/immich/secrets/ext-ssd.pw` は**末尾に改行を含めない**こと（`printf '%s' 'パスフレーズ' > file` で作成）。改行までパスフレーズの一部として扱われ、unlockに失敗する。暗号化しない運用の場合は鍵ファイル不要。
    - Disk Utilityで暗号化ボリュームのパスワードを「システムキーチェーンに保存」した場合、boot時の自動解除・マウントが可能になる（鍵ファイル不要）。挙動はmacOSバージョン依存のため、実機で確認してから鍵ファイル方式と置き換える。
 2. **プロパティリスト** `/Library/LaunchDaemons/com.photoserver.immich-autostart.plist`（`root:wheel`・`644`）。
 
@@ -240,9 +199,9 @@
 
 ## 秘密情報の扱い
 
-このリポジトリの `.env` は以前からGit追跡対象です。この準備ブランチでは `.env` を追跡対象から外し、`.gitignore` に追加します。ただし、過去のコミットに含まれた値はこの変更では消えません。リモートにpush済みの場合は、DBなどの認証情報を変更してください。認証情報をこの文書や `.env.example` に記載しないでください。
+`.env` と `/opt/immich/run/.env` を本リポジトリにコミットしない（`.gitignore` に登録済み）。DBパスワード等は過去のコミット履歴に残っている可能性があるため、リモートへpushする場合は認証情報の変更を検討すること。認証情報をこの文書や `.env.example` に記載しない。
 
-自動起動用の `/opt/immich/run/.env` も本リポジトリにはコミットしない。外付けSSDのUnlock用パスフレーズファイル `/opt/immich/secrets/ext-ssd.pw` は `root:wheel`・`600` とする。
+外付けSSDを暗号化する場合のUnlock用パスフレーズファイル `/opt/immich/secrets/ext-ssd.pw` は `root:wheel`・`600` とする（現状は非暗号化運用のため未作成）。
 
 ## 参考資料
 
